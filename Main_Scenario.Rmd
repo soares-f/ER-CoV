@@ -1,0 +1,437 @@
+---
+title: "Albert_Covid"
+author: "Felipe Soares"
+date: "4/3/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Loading required libraries
+```{r message=FALSE}
+library(readr)
+library(plyr)
+library(tidyverse)
+library(DMwR)
+library(e1071)
+library(pROC)
+library(caret)
+library(rpart)
+library(Rmisc)
+library(boot)
+library(dplyr)
+library(ggplot2)
+
+```
+
+Importing the data
+```{r message=FALSE}
+raw <- read_csv("raw_new.csv")
+```
+
+Changing name of the columns
+```{r}
+names(raw)[1] <- "Patient_ID"
+raw %>% remove_rownames %>% column_to_rownames(var="Patient_ID") -> raw
+
+```
+
+Imputing missing data with kNN and setting factors
+```{r}
+features_corrected <- raw
+features_corrected$Status <- as.factor(revalue(raw$Status,c("positive"=1,"negative"=0)))
+features_corrected$Age <- as.factor(raw$Age)
+features_corrected$regular_ward <- as.factor(features_corrected$regular_ward)
+features_corrected$semi_ICU <- as.factor(features_corrected$semi_ICU)
+features_corrected$ICU <- as.factor(features_corrected$ICU)
+features_corrected$Inf_B_rapid <- as.factor(features_corrected$Inf_B_rapid)
+only_numeric_features <-  as.data.frame(features_corrected[,8:ncol(features_corrected)])
+tmp <- knnImputation(only_numeric_features, k=5)
+data_imputed <- features_corrected[, ! names(features_corrected) %in% names(tmp), drop = F]
+data_imputed <- as.data.frame(cbind(data_imputed,tmp))
+# Testing as numeric
+data_imputed$Age <- as.numeric(data_imputed$Age)
+```
+
+
+Create test data for Level 2
+```{r }
+
+create_data_frame_test_l2_class <- function(test,predicted_class){
+  
+  test_level2 <- data.frame(Status=test$Status,
+                             
+#changed from 4 to 3
+
+#rus_svm=predict(ensembles[1],newdata=test[,c(1,4:ncol(test))],type="class"),
+rus_svm=3,
+                             #sbag_svm=predict(ensembles[2],newdata=test[,c(1,4:ncol(test))],type="class"),
+sbag_svm=4,
+                             sbo_svm=predicted_class,
+
+                             influenzaA = test$Inf_A_rapid,
+                             influenzaB = test$Inf_B_rapid)
+  names(test_level2) <- c("Status","rus_svm","sbag_svm","sbo_svm","influenzaA","influenzaB")
+  rownames(test_level2) <- rownames(test)
+  return(test_level2)
+  }
+
+```
+
+
+Creating a function to refine predictions
+```{r refine}
+refine_pred_l2 <- function(final_predictions,classi){
+  for(i in 1:nrow(final_predictions)){
+  if(final_predictions[i,classi]=="1"){
+    if(!is.na(final_predictions[i,"influenzaA"])){
+      if(final_predictions[i,"influenzaA"]=="positive"){
+        final_predictions[i,classi]=0
+        next
+      }
+      
+    }
+    if(!is.na(final_predictions[i,"influenzaB"])){
+      if(final_predictions[i,"influenzaB"]=="positive"){
+        final_predictions[i,"classi"]=0
+        next
+      }
+  }
+  }}
+  return(final_predictions)
+}
+
+```
+
+
+Adapting function from package embc to this problem
+```{r classifier_code}
+
+## Code Adapted from embc
+
+##### Set new class #####
+setClass("modelBag", representation = "list")
+setClass("modelBst", representation = "list")
+
+##### Funtion creation #####
+# Random under-sampling
+.ru <- function(target, data, ir = 1)    # ir = Imbalance Ratio. (how many times majority instances are over minority instances)
+{
+  p <- data[which(data[ ,target] == "1"), ]
+  n <- data[which(data[ ,target] == "0"), ]
+  n <- n[sample(nrow(n), nrow(p) * ir, replace = TRUE), ]
+  result <- rbind(p, n)
+  return(result)
+}
+
+
+# Weight update/ pseudo-loss calculation for AdaBoost.M2
+.wt.update <- function(probability, prediction, actual, wt, smooth)
+{
+  fp <- which(ifelse(prediction == "1" & actual == "0", TRUE, FALSE) == TRUE)
+  fn <- which(ifelse(prediction == "0" & actual == "1", TRUE, FALSE) == TRUE)
+  p_loss <- 0.5 * sum( wt[fp] * (1 - probability[fp, ][ ,"0"] + probability[fp, ][ ,"1"]),  # pseudo-loss
+                       wt[fn] * (1 - probability[fn, ][ ,"1"] + probability[fn, ][ ,"0"]) )
+  a <- (p_loss + smooth) / (1 - p_loss + smooth) # weight updater with prediction smoothing, dealing with a == 0
+  wt[c(fp, fn)] <- rep(1/(length(fp) + length(fn)), (length(fp) + length(fn)))
+  wt[fn] <- wt[fn] * a^(0.5 * (1 + probability[fn, ][ ,"1"] - probability[fn, ][ ,"0"]))
+  wt[fp] <- wt[fp] * a^(0.5 * (1 + probability[fp, ][ ,"0"] - probability[fp, ][ ,"1"]))
+  wt <- wt / sum(wt)
+  result <- list()
+  result[[1]] <- wt
+  result[[2]] <- a
+  return(result)
+}
+
+
+
+
+# SMOTEBoost
+sbo_svm <- function(formula, data, size, over = 100,under=0, level_pos = 0.5, 
+                svm.ker = "radial", svm.weights = c("0"=1,"1"=1),
+                svm.type = "C-classification", svm.nu = 0.5, svm.cost = 1
+                )
+{
+  target <- gsub(" ", "", unlist(strsplit(format(formula), split = "~"))[1])
+  list_model <- list()
+  a <- 0
+  n <- data[which(data[ ,target] == "0"), ]
+  p <- data[which(data[ ,target] == "1"), ]
+  data$w <- rep(1/nrow(data), nrow(data))
+  label <- data[ ,target]
+  for(i in 1:size)
+  {
+    n <- data[which(data[ ,target] == "0"), ]
+    f <- reformulate(paste(colnames(data)[which(colnames(data) != target & colnames(data) != "w")], collapse = "+"), response = target)
+    smote <- DMwR::SMOTE(f, data = data, perc.over = over, perc.under = under)
+    train <- rbind(n, smote)
+    train$w <- train$w / sum(train$w) # normalize sample weights
+    train <- train[sample(nrow(train), nrow(train), replace = TRUE, prob = train$w), ] # equivalent to pass w' to learner
+    train$w <- NULL # remove weight otherwise it will be used as a variable in when training
+    
+    
+    if(svm.type == "C-classification") {
+      list_model[[i]] <- e1071::svm(formula, data = train, kernel = svm.ker, probability = TRUE,
+                                   class.weights = svm.weights, cost = svm.cost)
+      prob <- as.data.frame(attr(predict(list_model[[i]], data, probability = TRUE), "prob"))
+      }
+    
+    
+    else if (svm.type == "nu-classification") {
+      list_model[[i]] <- e1071::svm(formula, data = train, type = "nu-classification", kernel = svm.ker, probability = TRUE,
+                                    class.weights = svm.weights, nu = svm.nu)
+      prob <- as.data.frame(attr(predict(list_model[[i]], data, probability = TRUE), "prob"))
+      }
+
+    pred <- as.factor(ifelse(prob[ ,"1"] >= level_pos, 1, 0))
+    new <- .wt.update(probability = prob, prediction = pred, actual = label, wt = data$w, smooth = 1/nrow(data))
+    data$w <- new[[1]]
+    a[i] <- new[[2]]
+  }
+  result <- list(weakLearners = list_model, errorEstimation = a)
+  attr(result, "class") <- "modelBst"
+  return(result)
+}
+
+# Prediction for Boosting-based method
+predict.modelBst <- function(object, newdata, type = "prob", level_pos = 0.5, ...)
+{
+  list_model <- object[[1]]
+  a <- object[[2]]
+  a <- log(1/a, base = exp(1)) / sum(log(1/a, base = exp(1))) # normalize alpha values into percentage
+  if(attr(list_model[[1]], "class")[2] %in% "svm") {
+    prob <- lapply(lapply(list_model, predict, newdata, probability = TRUE), attr, which = "probabilities")
+    prob <- lapply(prob, subset, select = "1")
+  }
+  else if(attr(list_model[[1]], "class")[1] == "rpart") {
+    prob <- lapply(lapply(list_model, predict, newdata, type = "prob"), subset, select = "1")
+  }
+  else if(attr(list_model[[1]], "class")[1] == "C5.0") {
+    prob <- lapply(lapply(list_model, predict, newdata, type = "prob"), subset, select = "1")
+  }
+  else if(attr(list_model[[1]], "class")[1] == "naiveBayes") {
+    prob <- lapply(lapply(list_model, predict, newdata, type = "raw"), subset, select = "1")
+  }
+  else if(attr(list_model[[1]], "class")[2] == "randomForest") {
+    prob <- lapply(lapply(list_model, predict, newdata, type = "prob"), subset, select = "1")
+  }
+  prob <- rowSums(mapply("*", prob, a))
+  if(type == "class") {
+    pred <- as.factor(ifelse(prob > level_pos, 1, 0))
+    return(pred)
+  }
+  else if(type == "prob") { return(prob) }
+}
+
+
+# Prediction for Bagging-based method
+predict.modelBag <- function(object, newdata, type = "prob", ...)
+{
+  a <- rep(1/length(object), length(object)) # voting weight
+  if(attr(object[[1]], "class")[2] %in% "svm") {
+    prob <- lapply(lapply(object, predict, newdata, probability = TRUE), attr, which = "probabilities")
+    prob <- lapply(prob, subset, select = "1")
+  }
+  else if(attr(object[[1]], "class")[1] == "rpart") {
+    prob <- lapply(lapply(object, predict, newdata, type = "prob"), subset, select = "1")
+  }
+  else if(attr(object[[1]], "class")[1] == "C5.0") {
+    prob <- lapply(lapply(object, predict, newdata, type = "prob"), subset, select = "1")
+  }
+  else if(attr(object[[1]], "class")[1] == "naiveBayes") {
+    prob <- lapply(lapply(object, predict, newdata, type = "raw"), subset, select = "1")
+  }
+  else if(attr(object[[1]], "class")[2] == "randomForest") {
+    prob <- lapply(lapply(object, predict, newdata, type = "prob"), subset, select = "1")
+  }
+  prob <- rowSums(mapply("*", prob, a))
+  if(type == "class") {
+    pred <- as.factor(ifelse(prob > 0.5, 1, 0))
+    return(pred)
+  }
+  else if(type == "prob") {
+    return(prob)
+  }
+}
+
+```
+
+
+
+Running the experiment (fixed seed 123 for reproducibility)
+```{r echo = T, results = 'hide' }
+
+# Fix seed for reproducibility
+set.seed(123)
+
+all_pred_prob_name <- list()
+
+all_sbo_svm_CM <- list()
+
+
+all_sbo_svm_roc <- list()
+
+
+all_errors_sbo_svm <- list()
+
+
+
+all_refine_sbo_svm_CM <-list()
+
+
+
+
+all_errors_refine_sbo_svm <- list()
+
+
+for(i in 1:100){
+  print(i)
+  
+  # Shuffle data
+  data_imputed_shuff <- data_imputed[sample(nrow(data_imputed)),]
+  
+  # Partition data
+  train.index <- createDataPartition(data_imputed_shuff$Status, p = .9, list = FALSE)
+  train_level1_all <- data_imputed_shuff[ train.index,c(1,7:22)]
+  test_all  <- data_imputed_shuff[-train.index,c(1,5,6,7:22)]
+
+  
+ 
+  
+  
+  
+  classifier <- sbo_svm(Status ~ . , data = train_level1_all, size=10, "svm",
+                        over=100,under=0,
+                        svm.ker="radial", svm.weights = c("0"=1,"1"=1),
+                        svm.type = "C-classification", level_pos = 0.5)
+  
+  pred_prob_test <- predict(classifier,newdata=test_all[,c(1,4:ncol(test_all))],type="prob")
+  pred_prob_train <- predict(classifier,newdata=train_level1_all,type="prob")
+  
+  roc_test <- roc(test_all$Status, pred_prob_test)
+  roc_train <- roc(train_level1_all$Status,pred_prob_train)
+  
+  
+  pred_test_class <- predict(classifier,newdata=test_all[,c(4:ncol(test_all))],type="class", 
+                  level_pos = 0.3)
+  
+  
+  all_sbo_svm_roc[[i]] <- as.numeric(roc_test$auc)
+  
+  
+  # Predict the testing data
+  test_level2_all <- create_data_frame_test_l2_class(test_all,pred_test_class)
+  
+  # Using vote strategy: create final_predictions data.frame
+  final_predictions <- test_level2_all
+  
+  # Data from vote
+  
+
+  
+  
+  # Data from individual classifiers without refinement
+    
+
+    all_sbo_svm_CM[[i]] <- confusionMatrix(final_predictions$sbo_svm, final_predictions$Status, positive="1")
+    
+    # Getting Errors
+    all_errors_sbo_svm[[i]] <- rownames(final_predictions[final_predictions$sbo_svm!=final_predictions$Status,])
+  
+  # Data from individual classifiers with refinement
+    
+    # Refining the predictions
+
+    final_predictions <- refine_pred_l2(final_predictions, "sbo_svm")
+   
+    # Getting Confusion Matrix
+
+    all_refine_sbo_svm_CM[[i]] <- confusionMatrix(final_predictions$sbo_svm, final_predictions$Status, positive="1")
+    
+    # Getting Errors
+
+    all_errors_refine_sbo_svm[[i]] <- rownames(final_predictions[final_predictions$sbo_svm!=final_predictions$Status,])   
+    
+    all_pred_prob_name[[i]] <- data.frame(probs=pred_prob_test, ids=rownames(test_all))
+    
+    print(all_sbo_svm_roc[[i]])
+    print( all_refine_sbo_svm_CM[[i]] )
+}
+
+```
+
+
+Getting the metrics
+
+```{r metrics}
+
+
+extract_metrics <- function(data_CM, metric){
+  metric_repetitions <- list()
+  for(i in 1:100){
+    metric_repetitions[i] <- data_CM[[i]]$byClass[metric]
+  }
+  
+final_metric <- unlist(metric_repetitions)
+}
+
+metrics <- data.frame(Sensitivity=extract_metrics(all_refine_sbo_svm_CM,"Sensitivity"),
+                      Specificity=extract_metrics(all_refine_sbo_svm_CM,"Specificity"),
+                      NPV=extract_metrics(all_refine_sbo_svm_CM,"Neg Pred Value"),
+                      PPV=extract_metrics(all_refine_sbo_svm_CM,"Pos Pred Value"))
+
+
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+ggplot(data=metrics, aes(Sensitivity)) + geom_histogram(fill=cbbPalette[6],bins=9) + xlim(0,1) + theme_light() + ylab("Count") + theme(text=element_text(size=15))
+ggplot(data=metrics, aes(Specificity)) + geom_histogram(fill=cbbPalette[6], bins=9) + xlim(0.80,1) + theme_light() + ylab("Count") + theme(text=element_text(size=15))
+ggplot(data=metrics, aes(NPV)) + geom_histogram(fill=cbbPalette[6], bins=9) + xlim(0.80,1) + theme_light() + ylab("Count") + xlab("Negative Predictive Value") + theme(text=element_text(size=15))
+ggplot(data=metrics, aes(PPV)) + geom_histogram(fill=cbbPalette[6], bins=9) + xlim(0.0,1)  +
+  theme_light() + ylab("Count") +  xlab("Positive Predictive Value") + theme(text=element_text(size=15))
+
+
+
+
+set.seed(123)
+
+
+samp_mean <- function(x, i) {
+  mean(x[i])
+}
+
+boot_Specificity <- boot(metrics$Specificity, samp_mean, R=500)
+boot_Sensitivity <- boot(metrics$Sensitivity, samp_mean, R=500)
+boot_NPV <- boot(metrics$NPV, samp_mean, R=500)
+boot_PPV <- boot(metrics$PPV, samp_mean, R=500)
+boot_auc <- boot(unlist(all_sbo_svm_roc), samp_mean, R=500)
+
+CI_Specificity <- boot.ci(boot.out = boot_Specificity, type = c("bca"))
+print(mean(metrics$Specificity))
+print(CI_Specificity)
+
+CI_Sensitivity <- boot.ci(boot.out = boot_Sensitivity, type = c("bca"))
+print(mean(metrics$Sensitivity))
+print(CI_Sensitivity)
+
+
+CI_NPV <- boot.ci(boot.out = boot_NPV, type = c("bca"))
+print(mean(metrics$NPV))
+print(CI_NPV)
+
+CI_PPV <- boot.ci(boot.out = boot_PPV, type = c("bca"))
+print(mean(metrics$PPV))
+print(CI_PPV)
+
+
+CI_AUC <- boot.ci(boot.out = boot_auc, type = c("bca"))
+print(mean(unlist(all_sbo_svm_roc)))
+print(CI_AUC)
+
+
+```
