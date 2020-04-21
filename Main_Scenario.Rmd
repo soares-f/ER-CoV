@@ -63,13 +63,7 @@ Create test data for Level 2
 create_data_frame_test_l2_class <- function(test,predicted_class){
   
   test_level2 <- data.frame(Status=test$Status,
-                             
-#changed from 4 to 3
-
-#rus_svm=predict(ensembles[1],newdata=test[,c(1,4:ncol(test))],type="class"),
-rus_svm=3,
-                             #sbag_svm=predict(ensembles[2],newdata=test[,c(1,4:ncol(test))],type="class"),
-sbag_svm=4,
+                            
                              sbo_svm=predicted_class,
 
                              influenzaA = test$Inf_A_rapid,
@@ -82,7 +76,7 @@ sbag_svm=4,
 ```
 
 
-Creating a function to refine predictions
+Creating a function to refine predictions if Influenza A/B is found in the patient
 ```{r refine}
 refine_pred_l2 <- function(final_predictions,classi){
   for(i in 1:nrow(final_predictions)){
@@ -302,40 +296,37 @@ for(i in 1:100){
  
   
   
-  
+  # Create the ith classifier
   classifier <- sbo_svm(Status ~ . , data = train_level1_all, size=10, "svm",
                         over=100,under=0,
                         svm.ker="radial", svm.weights = c("0"=1,"1"=1),
                         svm.type = "C-classification", level_pos = 0.5)
   
+  # Predict the ith testing instances
   pred_prob_test <- predict(classifier,newdata=test_all[,c(1,4:ncol(test_all))],type="prob")
   pred_prob_train <- predict(classifier,newdata=train_level1_all,type="prob")
   
+  # Evaluate ROC AUC
   roc_test <- roc(test_all$Status, pred_prob_test)
   roc_train <- roc(train_level1_all$Status,pred_prob_train)
   
-  
+  # Predict the ith testing instance with lower threshold
   pred_test_class <- predict(classifier,newdata=test_all[,c(4:ncol(test_all))],type="class", 
                   level_pos = 0.3)
   
   
+  # Store ROC
   all_sbo_svm_roc[[i]] <- as.numeric(roc_test$auc)
   
   
   # Predict the testing data
   test_level2_all <- create_data_frame_test_l2_class(test_all,pred_test_class)
   
-  # Using vote strategy: create final_predictions data.frame
   final_predictions <- test_level2_all
-  
-  # Data from vote
-  
-
-  
   
   # Data from individual classifiers without refinement
     
-
+    # Create confusion matrix 
     all_sbo_svm_CM[[i]] <- confusionMatrix(final_predictions$sbo_svm, final_predictions$Status, positive="1")
     
     # Getting Errors
@@ -384,8 +375,6 @@ metrics <- data.frame(Sensitivity=extract_metrics(all_refine_sbo_svm_CM,"Sensiti
                       PPV=extract_metrics(all_refine_sbo_svm_CM,"Pos Pred Value"))
 
 
-
-cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
 
 cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
 
