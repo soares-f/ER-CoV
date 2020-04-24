@@ -6,7 +6,10 @@ This repository contains the code used for the article "A novel specific artific
 
 To the best of our knowledge, this is the first solution of its kind. We developed a machine learning classifier that takes widely available simple blood exams as input and classifies samples as likely to be positive (having SARS-CoV-2) or negative (not having SARS-CoV-2). Our work has already been submitted to the Journal of the American Medical Informatics Association (JAMIA) and has been receiving media attention (https://bit.ly/2xNTes8). Our article preprint is already available online: https://www.medrxiv.org/content/10.1101/2020.04.10.20061036v2.
 
-![Envised Patient Workflow](/images/Workflow_Fig1.jpg)
+<p align="center"> 
+<img src="images/Workflow_Fig1.jpg">
+</p>
+
 
 ## Performance
 
